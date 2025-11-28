@@ -1,215 +1,126 @@
 # Repo Guardian
 
-A Python-based security scanner that monitors GitHub organizations for new public repositories and automatically scans them for exposed secrets using TruffleHog. The tool provides Slack notifications for new repositories and any security findings.
+A security tool that monitors GitHub repositories of organization members for changes and scans for potential secrets using TruffleHog.
 
-## Features
+## Overview
 
-- **Organization Monitoring**: Scans multiple GitHub organizations for all public repositories
-- **Incremental Scanning**: Only scans new repositories since the last run, improving efficiency
-- **Secret Detection**: Uses TruffleHog to scan for exposed secrets, API keys, and credentials
-- **Slack Integration**: Sends notifications for new repositories and security findings
-- **Comprehensive Logging**: Detailed logging to both console and files
-- **Structured Output**: Organized scan results with timestamps and raw data preservation
+Repo Guardian continuously monitors GitHub repositories belonging to members of specified organizations. It detects:
+
+- New repositories
+- New branches
+- Updated commits
+
+When changes are detected, it automatically scans them using TruffleHog to identify potential secrets or sensitive information that may have been accidentally committed. Findings can be sent to Slack for immediate notification.
 
 ## Prerequisites
 
-Before running the scanner, ensure you have the following installed:
-
-- **Python 3.7+**
-- **TruffleHog**: Secret scanning tool
-  ```bash
-  # Install via pip
-  pip install trufflehog
-  
-  # Or via Go
-  go install github.com/trufflesecurity/trufflehog/v3@latest
-  ```
-- **jq**: JSON processor
-  ```bash
-  # Ubuntu/Debian
-  sudo apt-get install jq
-  
-  # macOS
-  brew install jq
-  ```
+- Python 3.6+
+- GitHub Personal Access Token with appropriate permissions
+- Slack Webhook URL (for notifications)
+- TruffleHog CLI installed and available in PATH
+  - Download from: https://github.com/trufflesecurity/trufflehog
+- jq command-line JSON processor
+  - Install with: `apt-get install jq` (Ubuntu/Debian)
+  - Or: `brew install jq` (macOS)
 
 ## Installation
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd scan_user_repo
+1. Clone the repository:
+   ```
+   git clone https://github.com/your-org/repo-guardian.git
+   cd repo-guardian
    ```
 
-2. **Install Python dependencies**:
-   ```bash
+2. Install dependencies:
+   ```
    pip install -r requirements.txt
    ```
 
-3. **Set up configuration files** (see Configuration section below)
-
-## Configuration
-
-### Environment Variables
-
-Create a `.env` file in the `configs/` directory with the following variables:
-
-```bash
-# configs/.env
-GITHUB_TOKEN=your_github_personal_access_token
-SLACK_WEBHOOK=your_slack_webhook_url
-```
-
-**GitHub Token Requirements:**
-- Personal Access Token with the following scopes:
-  - `read:org` - Read organization membership
-  - `public_repo` - Access public repositories
-  - `read:user` - Read user profile information
-
-### Organization Configuration
-
-Edit `configs/config.yaml` to specify the GitHub organizations to monitor:
-
-```yaml
-organizations:
-  - your-org-1
-  - your-org-2
-  - your-org-3
-```
-
-### Slack Webhook Setup
-
-1. Create a Slack app in your workspace
-2. Enable Incoming Webhooks
-3. Create a webhook URL for your desired channel
-4. Add the webhook URL to your `.env` file
+3. Configure the application:
+   - Create a `.env` file in the `configs` directory with:
+     ```
+     GITHUB_TOKEN=your_github_token
+     SLACK_WEBHOOK=your_slack_webhook_url
+     ```
+   - Update `configs/config.yaml` with your organization names:
+     ```yaml
+     organizations:
+       - your-organization-1
+       - your-organization-2
+     ```
 
 ## Usage
 
+### Basic Usage
+
 Run the scanner with:
 
-```bash
+```
 python main.py
 ```
 
-The scanner will:
-1. Fetch all members from configured organizations
-2. Retrieve public repositories for each member
-3. Compare against previous scans to identify new repositories
-4. Scan new repositories with TruffleHog for secrets
-5. Send Slack notifications with results
-6. Save all results to timestamped directories
+This will:
+1. Fetch all members from the specified organizations
+2. Retrieve their repositories and branch information
+3. Compare with previous scan results to identify changes
+4. Scan changes with TruffleHog
+5. Send notifications for any findings
 
-## Output Structure
+### Options
 
-The scanner creates the following directory structure:
+- `--no-trufflehog`: Skip the TruffleHog scanning step (Useful for first scan)
+  ```
+  python main.py --no-trufflehog
+  ```
 
+## Continuous Monitoring
+
+For effective security monitoring, it's recommended to run Repo Guardian regularly. You can set it up as:
+
+### Cron Job (Linux/macOS)
+
+Add a cron job to run the script at regular intervals:
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add a line to run every 6 hours (adjust path as needed)
+0 */6 * * * cd /path/to/repo-guardian && python main.py >> /path/to/repo-guardian/cron.log 2>&1
 ```
-scan_results/
-├── 2025-01-15_14:30:25/
-│   ├── repos.txt          # All repositories found
-│   ├── new_repos.txt      # New repositories since last scan
-│   └── raw_output.json    # Raw TruffleHog scan results
-├── 2025-01-15_10:15:42/
-│   └── ...
-└── ...
 
-logs/
-├── 2025-01-15_14:30:25.log
-└── ...
-```
+### Task Scheduler (Windows)
 
-### File Descriptions
+1. Open Task Scheduler
+2. Create a new Basic Task
+3. Set the trigger (e.g., Daily)
+4. Set the action to start a program:
+   - Program/script: `python`
+   - Arguments: `main.py`
+   - Start in: `C:\path\to\repo-guardian`
 
-- **`repos.txt`**: Complete list of all public repositories found across all organization members
-- **`new_repos.txt`**: Repositories that weren't present in the previous scan
-- **`raw_output.json`**: Complete TruffleHog scan results in JSON format
-- **Log files**: Detailed execution logs with timestamps
+## How It Works
 
-## Slack Notifications
+1. **Organization Member Discovery**: Fetches all members from the configured GitHub organizations
+2. **Repository Monitoring**: Uses GitHub's GraphQL API to efficiently retrieve repository and branch information
+3. **Change Detection**: Compares current scan with previous scan to identify new or updated content
+4. **Secret Scanning**: Uses TruffleHog to scan changes for potential secrets
+5. **Notification**: Sends findings to Slack for immediate action
 
-The scanner sends three types of Slack notifications:
+## Output
 
-1. **New Repositories Found** (Yellow):
-   - Lists all newly discovered public repositories
-   - Sent when new repositories are detected
+Scan results are stored in the `scan_results` directory, organized by timestamp:
+- `commit_hash.json`: Current state of all repositories
+- `updated_commit.json`: Commits that have been updated since last scan
+- `new_repo.json`: New repositories detected
+- `new_branch.json`: New branches detected
+- `trufflehog_scan_results/`: TruffleHog scan findings
 
-2. **No New Repositories** (Green):
-   - Confirmation message when no new repositories are found
+## Logging
 
-3. **Secret Scan Results** (Red):
-   - Details of any secrets found by TruffleHog
-   - Includes repository name, detector type, and direct link to the finding
-   - Messages are batched (5 findings per message) to prevent truncation
-
-## Security Considerations
-
-- **Token Security**: Store your GitHub token securely and never commit it to version control
-- **Webhook Security**: Protect your Slack webhook URL as it provides direct access to your channel
-- **Permissions**: The scanner only accesses public repositories and organization membership information
-- **Data Retention**: Consider implementing a retention policy for scan results and logs
-
-## Troubleshooting
-
-### Common Issues
-
-**1. "Authentication failed" errors**
-- Verify your GitHub token is valid and has the required scopes
-- Check that the token hasn't expired
-
-**2. "Organization not found" errors**
-- Ensure organization names in `config.yaml` are correct
-- Verify your token has access to read the organization's membership
-
-**3. TruffleHog command not found**
-- Install TruffleHog using the instructions in Prerequisites
-- Ensure TruffleHog is in your system PATH
-
-**4. jq command not found**
-- Install jq using the instructions in Prerequisites
-
-**5. Slack notifications not working**
-- Verify your webhook URL is correct
-- Check that the Slack app has permission to post to the channel
-
-### Debug Mode
-
-For detailed debugging, check the log files in the `logs/` directory. Each run creates a timestamped log file with comprehensive execution details.
-
-## Development
-
-### Code Structure
-
-- **`main.py`**: Main application logic
-- **`configs/`**: Configuration files
-- **`scan_results/`**: Output directory for scan results
-- **`logs/`**: Application logs
-
-### Key Functions
-
-- **`get_org_members(org)`**: Fetches organization members using GraphQL
-- **`get_user_repos(member)`**: Retrieves user's public repositories
-- **`trufflehog_scan(repo_url)`**: Performs secret scanning on a repository
-- **`slack_notification(webhook, title, msg, color)`**: Sends Slack messages
-
-### Dependencies
-
-- `requests`: HTTP client for GitHub API calls
-- `python-dotenv`: Environment variable management
-- `PyYAML`: YAML configuration file parsing
-- `slack_sdk`: Slack webhook integration
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## Support
-
-For issues and questions:
-1. Check the troubleshooting section above
-2. Review the log files for detailed error information
-3. Open an issue in the repository with relevant log excerpts
+The application uses a standard Python logger with rotation support. Logs are stored in `repo_guardian_scanner.log` with the following information:
+- Timestamp
+- Log level
+- Service name
+- Message
+- Event type

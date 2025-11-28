@@ -1,0 +1,8 @@
+configs/.env
+*test*
+*.json
+venv/
+scan_results/
+logs/
+*.log*
+__pycache__

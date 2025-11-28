@@ -1,399 +1,316 @@
-import requests
-import json
-from dotenv import load_dotenv
-import yaml 
-import pathlib
+"""
+GitHub Continuous User Scanner
+
+This script monitors GitHub repositories of organization members for changes
+and scans for potential secrets using TruffleHog.
+"""
+
 import os
-from datetime import datetime, timedelta
-import subprocess
-import logging
-import time
-import shutil
+import pathlib
+import json
+import yaml
+import argparse
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 from slack_sdk.webhook import WebhookClient
 
+from github.client import GitHubClient
+from scanners.trufflehog import scan_updated_commits, scan_new_repositories, scan_new_branches
+from utils.slack import send_secret_alerts, send_new_repository_alert
+from utils.logger import setup_json_logging, log_info, log_error, log_warn
+
+# Constants and configuration
 ROOT_PATH = str(pathlib.Path(__file__).parent.resolve())
+MAX_WORKERS = 10
 
-load_dotenv(f"{ROOT_PATH}/configs/.env", override=True)
-
-with open(f"{ROOT_PATH}/configs/config.yaml", "r") as configs:
-    ORGS = yaml.safe_load(configs)["organizations"]
-    
-TOKEN = os.getenv("GITHUB_TOKEN")
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
-
-# GraphQL endpoint
-GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
-
-def run_graphql_query(query, variables=None):
+def load_config():
     """
-    Execute a GraphQL query against GitHub's API with exponential backoff
+    Load configuration from environment variables and config file.
+    
+    Returns:
+        tuple: (token, slack_webhook_url, organizations)
     """
-    headers = {
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json",
-    }
+    # Load environment variables
+    load_dotenv(f"{ROOT_PATH}/configs/.env", override=True)
     
-    payload = {
-        "query": query,
-        "variables": variables or {}
-    }
+    token = os.getenv("GITHUB_TOKEN")
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK")
     
-    # Retry delays: 1 min, 3 min, 5 min (in seconds)
-    delays = [60, 180, 300]
+    # Load configuration from YAML
+    with open(f"{ROOT_PATH}/configs/config.yaml", "r") as c:
+        configs = yaml.safe_load(c)
+        organizations = configs.get("organizations", [])
     
-    for attempt in range(4):  # 0, 1, 2, 3 (initial + 3 retries)
-        response = requests.post(GITHUB_GRAPHQL_URL, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            return response.json()
-        
-        # Log the failure
-        logging.info(f"Error: {response.status_code} (attempt {attempt + 1})")
-        logging.info(response.text)
-        
-        # If this was the last attempt, return None
-        if attempt == 3:
-            return None
-        
-        # Wait before retrying
-        delay = delays[attempt]
-        logging.info(f"Waiting {delay} seconds before retry...")
-        time.sleep(delay)
-    
-    return None
+    return token, slack_webhook_url, organizations
 
-def get_org_members(org):
+def load_previous_scan():
     """
-    Fetch all members from github organizations using GraphQL
-    """
-    logging.info(org)
+    Load results from the previous scan.
     
-    members = []
-    has_next_page = True
-    cursor = None
-    
-    # GraphQL query for organization members with pagination
-    query = """
-    query($org: String!, $cursor: String) {
-      organization(login: $org) {
-        membersWithRole(first: 100, after: $cursor) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            login
-          }
-        }
-      }
-    }
-    """
-    
-    while has_next_page:
-        variables = {
-            "org": org,
-            "cursor": cursor
-        }
-        
-        result = run_graphql_query(query, variables)
-        
-        if not result:
-            logging.info(f"Error fetching members for {org}: GraphQL query failed")
-            return None
-        
-        if "errors" in result:
-            logging.info(f"Error fetching members for {org}:")
-            logging.info(result["errors"])
-            return None
-        
-        data = result.get("data", {})
-        org_data = data.get("organization", {})
-        members_data = org_data.get("membersWithRole", {})
-        
-        # Extract member logins
-        for member in members_data.get("nodes", []):
-            members.append(member["login"])
-        
-        # Check if there are more pages
-        page_info = members_data.get("pageInfo", {})
-        has_next_page = page_info.get("hasNextPage", False)
-        cursor = page_info.get("endCursor", None)
-    
-    return members
-
-def get_user_repos(member):
-    """
-    Fetch org members public repositories using GraphQL
-    """
-    repos = []
-    has_next_page = True
-    cursor = None
-    
-    logging.info(f"Getting repos for {member}...")
-    
-    # GraphQL query for user repositories with pagination
-    query = """
-    query($username: String!, $cursor: String) {
-      user(login: $username) {
-        repositories(first: 100, after: $cursor, privacy: PUBLIC) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            url
-          }
-        }
-      }
-    }
-    """
-    
-    while has_next_page:
-        variables = {
-            "username": member,
-            "cursor": cursor
-        }
-        
-        result = run_graphql_query(query, variables)
-        
-        if not result:
-            logging.info(f"Error fetching repos for {member}: GraphQL query failed")
-            return None
-        
-        if "errors" in result:
-            logging.info(f"Error fetching repos for {member}:")
-            logging.info(result["errors"])
-            return None
-        
-        data = result.get("data", {})
-        user_data = data.get("user", {})
-        repos_data = user_data.get("repositories", {})
-        
-        # Extract repository URLs
-        for repo in repos_data.get("nodes", []):
-            repos.append(repo["url"])
-        
-        # Check if there are more pages
-        page_info = repos_data.get("pageInfo", {})
-        has_next_page = page_info.get("hasNextPage", False)
-        cursor = page_info.get("endCursor", None)
-    
-    return repos
-
-def setup_logging(log_file):
-    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-def trufflehog_scan(repo_url):
-    trufflehog_cmd = [
-            'trufflehog',
-            '--no-update',
-            'github',
-            f'--repo={repo_url}',
-            '--only-verified',
-            '--json'
-        ]
-        
-    jq_cmd = ['jq', '-s']
-
-    # Run trufflehog and pipe to jq
-    trufflehog_process = subprocess.Popen(
-        trufflehog_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    
-    jq_process = subprocess.Popen(
-        jq_cmd,
-        stdin=trufflehog_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    # Close trufflehog stdout to allow it to receive SIGPIPE
-    trufflehog_process.stdout.close()
-    
-    # Get the output
-    output, error = jq_process.communicate()
-    
-    # Wait for trufflehog to complete
-    trufflehog_process.wait()
-    
-    if jq_process.returncode != 0:
-        logging.info(f"jq command failed: {error}")
-        return [], []
-        
-    if trufflehog_process.returncode != 0:
-        logging.info(f"TruffleHog scan failed for {repo_url}")
-        return [], []
-    
-    try:
-        findings = []
-        results = json.loads(output)
-        logging.info(f"TruffleHog scan completed for {repo_url}. Found {len(results)} results.")  
-
-        for result in results:
-            detector_name = result.get("DetectorName")
-            link = result["SourceMetadata"]["Data"]["Github"]["link"]
-            finding = {
-                "detector_name": detector_name,
-                "link": link,
-                "repo_url": repo_url
-            }
-            findings.append(finding)
-
-
-        return findings, results
-    except json.JSONDecodeError as e:
-        logging.info(f"Failed to parse JSON output: {e}")
-        return [], []
-    
-def slack_notification(webhook, title, msg, color):    
-
-    logging.info("Sending slack message...")
-
-    response = webhook.send(
-            text= title, 
-            attachments=[
-                {
-                    "color": color,
-                    "fields": [{"value": msg}], 
-                }
-            ]
-        )
-    
-
-def cleanup_incomplete_scan(scan_dir):
-    """
-    Remove incomplete scan directory and log the cleanup
+    Returns:
+        dict: Previous scan results or empty dict if none found
     """
     try:
-        if os.path.exists(scan_dir):
-            shutil.rmtree(scan_dir)
-            logging.info(f"Removed incomplete scan directory: {scan_dir}")
-            return True
-    except Exception as e:
-        logging.info(f"Failed to cleanup scan directory {scan_dir}: {e}")
-        return False
-    return False
-
-def main():
-    slack_webhook = WebhookClient(SLACK_WEBHOOK)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-
-    log_dir = os.path.join(ROOT_PATH, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-
-    setup_logging(f"{log_dir}/{timestamp}.log")
- 
-    try:
-        # This will be previous scan result folder name    
-        previous_scan = sorted(os.listdir(f"{ROOT_PATH}/scan_results"), reverse=True)
-
-        if previous_scan:
-            logging.info(f"previous_scan: {previous_scan[0]}")
-            with open(f"{ROOT_PATH}/scan_results/{previous_scan[0]}/repos.txt", 'r') as file:
-                previous_scan_repositories = [line.strip() for line in file]
+        previous_scans = sorted(os.listdir(f"{ROOT_PATH}/scan_results"), reverse=True)
+        
+        if previous_scans:
+            log_info(f"Previous scan: {previous_scans[0]}", 
+                    event_type="scan.repo_guardian.previous_scan_file")
+            with open(f"{ROOT_PATH}/scan_results/{previous_scans[0]}/commit_hash.json", 'r') as file:
+                return json.load(file)
         else:
-            previous_scan_repositories = []
-    except:
-        previous_scan_repositories = []
+            return {}
+    except Exception as e:
+        return {}
 
-
+def create_scan_directory():
+    """
+    Create a directory for the current scan results.
+    
+    Returns:
+        str: Path to the scan directory
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     scan_dir = os.path.join(ROOT_PATH, "scan_results", timestamp)
     os.makedirs(scan_dir, exist_ok=True)
+    return scan_dir
+
+def fetch_all_members(github_client, organizations):
+    """
+    Fetch all members from the specified organizations.
     
-    scan_failed = False
-    members = []
-
-    # Track failures during member collection
-    for org in ORGS:
-        org_members = get_org_members(org)
-        if org_members is None:  # get_org_members failed
-            logging.info(f"Failed to get members for organization: {org}")
-            scan_failed = True
-            break
-        members.extend(org_members)
-
-    if not scan_failed:
-        members = list(set(members))
-        repos = []
+    Args:
+        github_client (GitHubClient): GitHub client instance
+        organizations (list): List of organization names
         
-        # Track failures during repository collection
-        for member in members:
-            member_repos = get_user_repos(member)
-            if member_repos is None:  # get_user_repos failed
-                logging.info(f"Failed to get repositories for member: {member}")
-                scan_failed = True
-                break
-            repos.extend(member_repos)
-
-    # Cleanup if scan failed
-    if scan_failed:
-        cleanup_incomplete_scan(scan_dir)
-        logging.info("Scan failed due to GraphQL errors. Incomplete results cleaned up.")
-        return  # Exit early
-
-    with open(f"{scan_dir}/repos.txt", "w") as f:
-        f.write("\n".join(repos))
-
-    new_repos = []
-    for repo in repos:
-        if repo not in previous_scan_repositories:
-            new_repos.append(repo)
+    Returns:
+        list: List of unique member logins
+    """
+    members = []
+    for org in organizations:
+        org_members = github_client.get_org_members(org)
+        if org_members is None:
+            log_warn(f"Failed to get members for organization: {org}", 
+                    event_type="scan.repo_guardian.fetch_users")
+            continue
+        members.extend(org_members)
     
-    with open(f"{scan_dir}/new_repos.txt", "w") as f:
-        f.write("\n".join(new_repos))
+    # Remove duplicates
+    return list(set(members))
+
+def fetch_member_repositories(github_client, members):
+    """
+    Fetch repositories for all members using multithreading.
+    
+    Args:
+        github_client (GitHubClient): GitHub client instance
+        members (list): List of member logins
+        
+    Returns:
+        dict: Dictionary of member repositories
+    """
+    log_info(f"🚀 Starting threaded repository fetch for {len(members)} members", 
+            event_type="scan.repo_guardian.fetch_repositories")
+    log_info(f"🔧 Using {MAX_WORKERS} worker threads", 
+            event_type="scan.repo_guardian.multithread")
+    
+    current_scan_result = {}
+    completed_count = 0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        futures = [executor.submit(github_client.fetch_single_user, member) for member in members]
+        
+        # Collect results as they complete
+        for future in as_completed(futures):
+            member, user_repos = future.result()
+            completed_count += 1
+            
+            if user_repos is not None:
+                current_scan_result[member] = user_repos
+                percentage = (completed_count / len(members)) * 100
+                log_info(f"📊 Progress: {completed_count}/{len(members)} ({percentage:.1f}%) - ✅ {member}", 
+                        event_type="scan.repo_guardian.fetch_repositories")
+            else:
+                percentage = (completed_count / len(members)) * 100
+                log_warn(f"📊 Progress: {completed_count}/{len(members)} ({percentage:.1f}%) - ⚠️ Skipped {member}", 
+                        event_type="scan.repo_guardian.fetch_repositories")
+    
+    successful_users = len(current_scan_result)
+    failed_users = len(members) - successful_users
+    log_info(f"🎉 Threaded fetch completed: {successful_users} successful, {failed_users} failed", 
+            event_type="scan.repo_guardian.fetch_repositories")
+    
+    return current_scan_result
+
+def save_scan_results(scan_dir, current_scan, updated_commits, new_repos, new_branches):
+    """
+    Save scan results to files.
+    
+    Args:
+        scan_dir (str): Path to the scan directory
+        current_scan (dict): Current scan results
+        updated_commits (dict): Updated commits
+        new_repos (dict): New repositories
+        new_branches (dict): New branches
+    """
+    with open(f"{scan_dir}/commit_hash.json", "w") as file:
+        json.dump(current_scan, file, indent=4)
+    
+    with open(f"{scan_dir}/updated_commit.json", "w") as file:
+        json.dump(updated_commits, file, indent=4)
+    
+    with open(f"{scan_dir}/new_repo.json", "w") as file:
+        json.dump(new_repos, file, indent=4)
+    
+    with open(f"{scan_dir}/new_branch.json", "w") as file:
+        json.dump(new_branches, file, indent=4)
+
+def extract_repo_urls(new_repos):
+    """
+    Extract repository URLs from new repositories dictionary.
+    
+    Args:
+        new_repos (dict): New repositories dictionary
+        
+    Returns:
+        list: List of unique repository URLs
+    """
+    repo_urls = []
+    for repository in new_repos:
+        username, repo_name, _ = repository.split("::", 2)
+        repo_url = f"https://github.com/{username}/{repo_name}"
+        
+        # Avoid duplicates (multiple branches in the same repo)
+        if repo_url not in repo_urls:
+            repo_urls.append(repo_url)
+    
+    return repo_urls
+
+def run_trufflehog_scans(scan_dir, updated_commits, new_repos, new_branches):
+    """
+    Run TruffleHog scans on updated commits, new repositories, and new branches.
+    
+    Args:
+        scan_dir (str): Path to the scan directory
+        updated_commits (dict): Updated commits
+        new_repos (dict): New repositories
+        new_branches (dict): New branches
+        
+    Returns:
+        list: Combined list of all findings
+    """
+    log_info("/--------------------Starting Trufflehog Scan--------------------/", 
+            event_type="scan.repo_guardian.trufflehog.start")
+    
+    trufflehog_scan_dir = "trufflehog_scan_results"
+    os.makedirs(os.path.join(scan_dir, trufflehog_scan_dir), exist_ok=True)
     
     all_findings = []
-    all_raw_output = []
-    if new_repos:
-        msg = '\n'.join(new_repos)
-        slack_notification(slack_webhook, "New Public User Repository", msg, "#FFFF00")
+    
+    # Scan updated commits
+    if updated_commits:
+        findings, raw_output = scan_updated_commits(updated_commits)
+        all_findings.extend(findings)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/updated_commit.json", "w") as file:
+            json.dump(findings, file, indent=4)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/updated_commit_raw.json", "w") as file:
+            json.dump(raw_output, file, indent=4)
+    
+    # Scan new repositories
+    repo_urls = extract_repo_urls(new_repos)
+    if repo_urls:
+        findings, raw_output = scan_new_repositories(repo_urls)
+        all_findings.extend(findings)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/new_repos.json", "w") as file:
+            json.dump(findings, file, indent=4)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/new_repos_raw.json", "w") as file:
+            json.dump(raw_output, file, indent=4)
+    
+    # Scan new branches
+    if new_branches:
+        findings, raw_output = scan_new_branches(new_branches)
+        all_findings.extend(findings)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/new_branches.json", "w") as file:
+            json.dump(findings, file, indent=4)
+        
+        with open(f"{scan_dir}/{trufflehog_scan_dir}/new_branches_raw.json", "w") as file:
+            json.dump(raw_output, file, indent=4)
+    
+    log_info("/--------------------Completed Trufflehog Scan--------------------/", 
+            event_type="scan.repo_guardian.trufflehog.complete")
+    
+    return all_findings, repo_urls
 
-        for repo in new_repos:
-            logging.info(f"Performing trufflehog scan for: {repo}")
-            trufflehog_findings, raw_output = trufflehog_scan(repo_url=repo)
-            all_findings.extend(trufflehog_findings)
-            all_raw_output.extend(raw_output)
-    else:
-        # slack_notification(slack_webhook, "New Public User Repository", "No new repositories found", "#008000")
-        logging.info(f"No new repositories found, skipping trufflehog scan")
-
-    with open(f"{scan_dir}/raw_output.json", "a") as f:
-        json.dump(all_raw_output, f, indent=4)
-
-    secret_msg = ""
-    for idx, finding  in enumerate(all_findings, start=1):
-        detector_name = finding.get("detector_name")
-        link = finding.get("link")
-        username = finding.get("repo_url").split("/")[-2]
-        repo_name = finding.get("repo_url").split("/")[-1]
-        secret_msg = secret_msg + f"Repository Name: {username}/{repo_name}\nDetector: {detector_name}\nLink: {link}" + "\n\n"
-
-        # Break into multiple slack messages to prevent the slack message from being truncated
-        if idx % 5 == 0 or idx == len(all_findings):
-            slack_notification(slack_webhook, "New Public User Repository Secret Scan", secret_msg, "#FF0000")
-            secret_msg = ""
-
-    if not all_findings:
-        logging.info("trufflehog scan - no secret found")
-        # slack_notification(slack_webhook, "New Public User Repository Secret Scan", "No Secret Found", "#008000")
-           
+def main():
+    """
+    Main function to run the GitHub continuous user scanner.
+    """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='Monitor GitHub repositories of organization members for changes and scan for secrets'
+    )
+    parser.add_argument('--no-trufflehog', action='store_true', help='Disable trufflehog scan')
+    args = parser.parse_args()
+    
+    # Load configuration
+    token, slack_webhook_url, organizations = load_config()
+    
+    # Set up logging
+    setup_json_logging(
+        service_name="repo_guardian", 
+        log_file=f"{ROOT_PATH}/repo_guardian_scanner.log"
+    )
+    
+    # Create Slack webhook client
+    slack_webhook = WebhookClient(slack_webhook_url)
+    
+    # Create GitHub client
+    github_client = GitHubClient(token)
+    
+    # Load previous scan results
+    previous_scan_result = load_previous_scan()
+    
+    # Create directory for current scan results
+    scan_dir = create_scan_directory()
+    
+    # Fetch all members from organizations
+    members = fetch_all_members(github_client, organizations)
+    
+    # Fetch repositories for all members
+    current_scan_result = fetch_member_repositories(github_client, members)
+    
+    # Compare current scan with previous scan
+    updated_commits, new_repos, new_branches = github_client.compare_commit_hash(
+        current_scan_result, previous_scan_result
+    )
+    
+    # Save scan results
+    save_scan_results(scan_dir, current_scan_result, updated_commits, new_repos, new_branches)
+    
+    # Send notification for new repositories
+    repo_urls = extract_repo_urls(new_repos)
+    if repo_urls:
+        send_new_repository_alert(slack_webhook, repo_urls)
+    
+    # Run TruffleHog scans if enabled
+    if not args.no_trufflehog:
+        all_findings, _ = run_trufflehog_scans(scan_dir, updated_commits, new_repos, new_branches)
+        
+        # Send Slack notifications for findings
+        log_info("/--------------------Sending Slack Message--------------------/", 
+                event_type="scan.repo_guardian.slack")
+        
+        send_secret_alerts(slack_webhook, all_findings)
+        
+        log_info("/--------------------Slack Message Sent--------------------/", 
+                event_type="scan.repo_guardian.slack")
 
 if __name__ == "__main__":
     main()
